@@ -1,8 +1,11 @@
-const{randomUUID}=require("crypto");
+const { randomUUID } = require("crypto");
 const policies = require("../config/policies.json");
 const store = require("../store/documentStore");
 const { sendToOCR } = require("../services/pythonClient");
 const { verify } = require("../services/verifier.service");
+const {
+  mapSingleVerification
+} = require("../utils/responseMapper");
 
 /**
  * Ingest document → OCR → store extracted data
@@ -10,18 +13,26 @@ const { verify } = require("../services/verifier.service");
 exports.ingest = async (req, res) => {
   const documentId = randomUUID();
 
+  if (!req.file) {
+    return res.status(400).json({
+      error: "File missing. Use multipart/form-data with key 'file'"
+    });
+  }
+
   try {
     const extracted = await sendToOCR(req.file);
     store.save(documentId, extracted);
-  } catch {
+  } catch (err) {
+    console.error("OCR failed:", err.message);
     store.save(documentId, {});
   }
 
-  res.json({ document_id: documentId });
+  res.status(201).json({ document_id: documentId });
 };
 
+
 /**
- * Single document verification
+ * Single document verification (CLEAN RESPONSE)
  */
 exports.verifySingle = (req, res) => {
   const { document_id, policy_id } = req.body;
@@ -33,15 +44,24 @@ exports.verifySingle = (req, res) => {
     });
   }
 
-  const data = store.get(document_id) || {};
+  const data = store.get(document_id);
+  if (!data) {
+    return res.status(404).json({
+      error: `Document not found: ${document_id}`
+    });
+  }
+
+  // Internal full verification
   const results = verify(data, policy);
 
-  res.json({ document_id, results });
+  // 🔥 Production response
+  const response = mapSingleVerification(document_id, results);
+
+  res.json(response);
 };
 
-
 /**
- * Batch verification
+ * Batch verification (SUMMARY ONLY)
  */
 exports.verifyBatch = (req, res) => {
   const { document_ids, policy_id } = req.body;
@@ -57,24 +77,25 @@ exports.verifyBatch = (req, res) => {
     const data = store.get(id) || {};
     const results = verify(data, policy);
 
+    let overall_status = "VERIFIED";
     const fields = {};
-    let overall = "VERIFIED";
 
-    for (const f of policy.required_fields) {
-      fields[f] = results[f]?.status || "MISSING";
-      if (fields[f] === "MISSING") overall = "MISSING";
-      else if (fields[f] === "FLAGGED" && overall !== "MISSING")
-        overall = "FLAGGED";
+    for (const field of policy.required_fields) {
+      const status = results[field]?.status || "MISSING";
+      fields[field] = status;
+
+      if (status === "MISSING") overall_status = "MISSING";
+      else if (status === "FLAGGED" && overall_status !== "MISSING") {
+        overall_status = "FLAGGED";
+      }
     }
 
-    return { document_id: id, overall_status: overall, fields };
+    return {
+      document_id: id,
+      overall_status,
+      fields
+    };
   });
 
   res.json({ candidates });
 };
-
-
-/*
-This prototype processes documents synchronously and can be extended
-to async batch pipelines and persistent storage in production.
-*/

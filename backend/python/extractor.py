@@ -1,11 +1,37 @@
-from paddleocr import PaddleOCR
+import pytesseract
+from PIL import Image, ImageEnhance
+import cv2
+import numpy as np
 import re
 
-ocr = PaddleOCR(use_angle_cls=True, lang="en")
+pytesseract.pytesseract.tesseract_cmd = r"D:\products\AuthDoc\tesseract\tesseract.exe"
+
+
+def preprocess_image(path: str):
+    img = Image.open(path).convert("L")
+
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.5)
+
+    img = np.array(img)
+
+    img = cv2.fastNlMeansDenoising(img, None, 20, 7, 21)
+
+    return img
+
+
+def validate_image(img):
+    h, w = img.shape
+    if w < 800 or h < 1000:
+        return False, "Image resolution too low for OCR"
+    return True, None
+
 
 def normalize(text: str):
-    text = text.replace("(", " ").replace(")", " ")
-    return re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+", " ", text.replace("(", " ").replace(")", " "))
+
+def to_float(value: str):
+    return float(value.replace(",", "."))
 
 def extract_fields(text: str):
     text = normalize(text)
@@ -14,48 +40,62 @@ def extract_fields(text: str):
         m = re.search(pattern, text, re.I)
         return m.group(1).strip() if m else None
 
-    subjects_raw = re.findall(
-        r"([A-Z][A-Z &]+)\s+\d+\s+\d+\s+([A-Z+]+)",
-        text
+    gpa = re.search(
+        r"(GPA|GEA|GRADE POINT AVERAGE|GRADE POINT AVORAG[E|O])[^0-9]{0,20}([\d]+[.,][\d]+)",
+        text,
+        re.I
+        )
+
+    cgpa = re.search(
+    r"(CGPA|COPA|CUMULATIVE GRADE POINT AVERAGE|CUMULATIVE GRADE POINT AVORAG[E|O])[^0-9]{0,20}([\d]+[.,][\d]+)",
+    text,re.I
     )
+    subjects = re.findall(
+    r"\b([A-Z]{2,4}\d{2,4})\s+[A-Z &]+\s+\d+\s+\d+\s+([A-Z+])",
+    text
+)
 
-    subject_grades = (
-        [{"subject": s.strip(), "grade": g} for s, g in subjects_raw]
-        if subjects_raw else None
-    )
+    subject_grades = [
+    {"code": c, "grade": g}
+    for c, g in subjects
+]
 
-    result_status = None
-    if subject_grades:
-        result_status = "PASS"
-        for s in subject_grades:
-            if s["grade"] in ["RA", "FAIL"]:
-                result_status = "FAIL"
-                break
 
-    gpa = find(r"GPA[^0-9]*([\d]+\.\d+)")
-    cgpa = find(r"CGPA[^0-9]*([\d]+\.\d+)")
 
     return {
-        "student_name": find(r"Name\s+of\s+the\s+Candidate\s+([A-Z ]+)"),
-        "register_number": find(r"Register\s*No\s*([A-Z0-9]+)"),
-        "programme_or_branch": find(r"Programme\s*/\s*Branch\s+([A-Z .]+)"),
+        "student_name": find(r"NAME\s+OF\s+THE\s+CANDI[A-Z]{2,4}\s+([A-Z ]+)"),
+        "register_number": find(r"REGISTER\s*NO\s*[:\-]?\s*([A-Z0-9]+)"),
+        "programme_or_branch": find(r"PROGRAMME\s*&?\s*BRANCH\s*[:\-]?\s*([A-Z .]+)"),
         "semester": find(r"(FIRST|SECOND|THIRD|FOURTH)\s+SEMESTER"),
-        "gpa": float(gpa) if gpa else None,
-        "cgpa": float(cgpa) if cgpa else None,
-        "result_status": result_status,
-        "subject_grades": subject_grades
+        "subject_grades": subject_grades if subject_grades else [],
+        "gpa": to_float(gpa.group(2)) if gpa else None,
+        "cgpa": to_float(cgpa.group(2)) if cgpa else None,
+
     }
+
 
 def run_ocr(path: str):
     print(">>> OCR FUNCTION ENTERED <<<", path)
 
-    result = ocr.ocr(path)
-    print("RAW OCR RESULT:", result)
+    try:
+        img = preprocess_image(path)
 
-    text = "\n".join([line[1][0] for page in result for line in page])
+        ok, err = validate_image(img)
+        if not ok:
+            return {"error": err}
 
-    print("==== OCR RAW TEXT START ====")
-    print(text)
-    print("==== OCR RAW TEXT END ====")
+        text = pytesseract.image_to_string(
+            img,
+            lang="eng",
+            config="--oem 3 --psm 6"
+        )
 
-    return extract_fields(text)
+        print("==== OCR RAW TEXT START ====")
+        print(text)
+        print("==== OCR RAW TEXT END ====")
+
+        return extract_fields(text)
+
+    except Exception as e:
+        print("OCR ERROR:", e)
+        return {"error": "OCR failed"}
